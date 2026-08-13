@@ -175,6 +175,8 @@ jobs:
             ### What’s new
             - **Spotify playlists** — paste an open.spotify.com link; the app reads titles only, then searches SoundCloud / YouTube (never downloads from Spotify)
             - **Qualité max** — checks bitrate / duration after download and retries better matches
+            - Downloads to a local temp folder first, then copies to the destination (fixes USB sticks where ffprobe failed and every track scored 0.40)
+            - Keeps the file if quality cannot be measured instead of rejecting it
             - Clean filenames (`Artist - Title.m4a`), fewer wrong matches (mixes, visualizers, wrong songs)
             - End-of-run list of **tracks that failed** so you can retry missing ones
             - Converts leftover `.webm` / `.mp4` to `.m4a`

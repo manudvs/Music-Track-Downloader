@@ -29,6 +29,7 @@ import yt_dlp
 from audio_quality import (
     analyze_audio,
     candidate_acceptable,
+    duration_match_score,
     meets_min_quality,
     newest_audio_file,
     quality_score,
@@ -1211,6 +1212,13 @@ def candidate_url(entry: dict[str, Any], *, youtube: bool) -> str | None:
     return url
 
 
+def track_scratch_dir() -> Path:
+    """Local temp folder — never on USB (ffprobe/ffmpeg fail there often)."""
+    base = Path(tempfile.gettempdir()) / "mtd-tracks"
+    base.mkdir(parents=True, exist_ok=True)
+    return Path(tempfile.mkdtemp(prefix="mtd-track-", dir=str(base)))
+
+
 def evaluate_new_file(
     output_dir: Path,
     before: set[str],
@@ -1219,6 +1227,23 @@ def evaluate_new_file(
 ) -> tuple[Path | None, Any]:
     path = newest_audio_file(output_dir, before)
     if path is None:
+        # yt-dlp sometimes writes dl.m4a / dl.webm after snapshot
+        for candidate in sorted(
+            output_dir.iterdir(),
+            key=lambda p: p.stat().st_mtime if p.is_file() else 0,
+            reverse=True,
+        ):
+            if (
+                candidate.is_file()
+                and candidate.suffix.lower()
+                in {".m4a", ".mp3", ".opus", ".wav", ".flac", ".aac", ".mp4", ".webm"}
+                and candidate.name not in before
+                and not candidate.name.startswith("_best")
+                and candidate.stat().st_size > 1024
+            ):
+                path = candidate
+                break
+    if path is None:
         return None, None
     if path.suffix.lower() in {".webm", ".mp4"}:
         converted = convert_file_to_m4a(path)
@@ -1226,6 +1251,9 @@ def evaluate_new_file(
             path = converted
     probe = resolve_ffprobe_bin(resolve_ffmpeg_dir())
     quality = analyze_audio(path, ffprobe=probe)
+    if quality is None:
+        time.sleep(0.4)
+        quality = analyze_audio(path, ffprobe=probe)
     return path, quality
 
 
@@ -1373,7 +1401,7 @@ def download_search_with_quality(
     tried = 0
     hold_file = "_best.m4a"
 
-    temp_dir = Path(tempfile.mkdtemp(prefix="mtd-track-", dir=output_dir))
+    temp_dir = track_scratch_dir()
     hold_path = temp_dir / hold_file
     try:
         for source, entry in ordered:
@@ -1443,12 +1471,18 @@ def download_search_with_quality(
                     log(f"[{index:02d}/{total}]   ↳ rejeté après analyse ({quality.summary()})")
                     continue
 
-            score = (
-                quality_score(quality, expected_duration=expected_duration)
-                if quality
-                else 0.4
-            )
-            summary = quality.summary() if quality else "qualité inconnue"
+            if quality:
+                score = quality_score(quality, expected_duration=expected_duration)
+                summary = quality.summary()
+            else:
+                # ffprobe often fails on USB / slow disks — keep the file, score from metadata
+                size_mb = path.stat().st_size / (1024 * 1024)
+                score = 0.55 + 0.35 * duration_match_score(
+                    cand_dur_f, expected_duration
+                )
+                if size_mb < 0.4:
+                    score -= 0.2
+                summary = f"fichier {size_mb:.1f} Mo (ffprobe indisponible)"
             log(f"[{index:02d}/{total}]   ↳ {summary} (score {score:.2f})")
 
             if score > best_score:
@@ -1470,7 +1504,9 @@ def download_search_with_quality(
             log(f"[{index:02d}/{total}] Échec recherche: {queries[0]}")
             return "failed"
 
-        if accept_strict and best_score < 0.55:
+        # Never discard a downloaded file just because ffprobe could not read it
+        # (common on USB sticks). Only reject if we measured quality and it is terrible.
+        if accept_strict and best_score < 0.35:
             log(f"[{index:02d}/{total}] Aucune version fiable (score {best_score:.2f})")
             return "failed"
 
