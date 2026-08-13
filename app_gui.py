@@ -416,12 +416,14 @@ class DownloadWorker(QThread):
         output: Path,
         browser: str,
         skip_existing: bool,
+        quality_max: bool = True,
     ) -> None:
         super().__init__()
         self.url = url
         self.output = output
         self.browser = browser
         self.skip_existing = skip_existing
+        self.quality_max = quality_max
 
     def run(self) -> None:
         set_log_callback(lambda message: self.line.emit(message))
@@ -433,6 +435,7 @@ class DownloadWorker(QThread):
                 jobs=optimal_jobs(),
                 skip_existing=self.skip_existing,
                 youtube_fallback=True,
+                quality_max=self.quality_max,
             )
         except Exception as exc:  # noqa: BLE001
             self.line.emit(f"Erreur : {exc}")
@@ -495,7 +498,7 @@ class MainWindow(QMainWindow):
         layout.addSpacing(6)
 
         tagline = QLabel(
-            "SoundCloud ou YouTube → fichiers audio, prêts pour la clé USB."
+            "SoundCloud, YouTube ou Spotify → fichiers audio, prêts pour la clé USB."
         )
         tagline.setObjectName("tagline")
         tagline.setWordWrap(True)
@@ -523,7 +526,7 @@ class MainWindow(QMainWindow):
         self.url_input = QLineEdit()
         self.url_input.setObjectName("urlInput")
         self.url_input.setPlaceholderText(
-            "Colle un lien SoundCloud ou YouTube (piste ou playlist)…"
+            "Colle un lien SoundCloud, YouTube ou Spotify (piste ou playlist)…"
         )
         self.url_input.returnPressed.connect(self.start_download)
         self.url_input.editingFinished.connect(self._refresh_title_from_url)
@@ -637,6 +640,14 @@ class MainWindow(QMainWindow):
         self.skip_existing = QCheckBox("Ignorer déjà téléchargés")
         self.skip_existing.setChecked(True)
         toggles.addWidget(self.skip_existing)
+        self.quality_max = QCheckBox("Qualité max")
+        self.quality_max.setChecked(True)
+        self.quality_max.setToolTip(
+            "Vérifie le bitrate / la durée après téléchargement et cherche "
+            "une meilleure version (SoundCloud / YouTube) si besoin. "
+            "Plus lent, meilleur rendu USB."
+        )
+        toggles.addWidget(self.quality_max)
         opt_layout.addLayout(toggles, stretch=1)
 
         layout.addWidget(options)
@@ -644,7 +655,9 @@ class MainWindow(QMainWindow):
 
         account_hint = QLabel(
             "YouTube : choisis Chrome (connecté à youtube.com) pour éviter le blocage bot. "
-            "SoundCloud : même navigateur si tu as un compte. Safari souvent bloqué sur Mac."
+            "SoundCloud : même navigateur si tu as un compte. "
+            "Spotify : on lit seulement la liste, puis on cherche ailleurs (jamais depuis Spotify). "
+            "Safari souvent bloqué sur Mac."
         )
         account_hint.setObjectName("hint")
         account_hint.setWordWrap(True)
@@ -860,14 +873,14 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(
                 self,
                 "URL manquante",
-                "Colle un lien SoundCloud ou YouTube (piste ou playlist).",
+                "Colle un lien SoundCloud, YouTube ou Spotify (piste ou playlist).",
             )
             return
         if not is_supported_media_url(url):
             QMessageBox.warning(
                 self,
                 "URL non supportée",
-                "Utilise un lien SoundCloud ou YouTube — piste seule ou playlist.",
+                "Utilise un lien SoundCloud, YouTube ou Spotify — piste seule ou playlist.",
             )
             return
 
@@ -896,6 +909,7 @@ class MainWindow(QMainWindow):
             output=output,
             browser=browser,
             skip_existing=self.skip_existing.isChecked(),
+            quality_max=self.quality_max.isChecked(),
         )
         self.worker.line.connect(self.append_log)
         self.worker.finished_ok.connect(self.on_finished)

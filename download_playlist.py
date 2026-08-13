@@ -26,8 +26,25 @@ from urllib.parse import parse_qs, quote, urlencode, urlparse, urlunparse
 
 import yt_dlp
 
-ResultKind = Literal["soundcloud", "youtube", "skipped", "failed", "cancelled"]
-Platform = Literal["soundcloud", "youtube"]
+from audio_quality import (
+    analyze_audio,
+    candidate_acceptable,
+    meets_min_quality,
+    newest_audio_file,
+    quality_score,
+    rank_search_candidates,
+    resolve_ffprobe_bin,
+    sanitize_filename_stem,
+)
+from spotify_meta import (
+    fetch_spotify_catalog,
+    is_spotify_url,
+    parse_spotify_url,
+    spotify_tracks_as_entries,
+)
+
+ResultKind = Literal["soundcloud", "youtube", "spotify", "skipped", "failed", "cancelled"]
+Platform = Literal["soundcloud", "youtube", "spotify"]
 MediaKind = Literal["track", "playlist"]
 print_lock = threading.Lock()
 cleanup_lock = threading.Lock()
@@ -331,67 +348,129 @@ def apply_js_runtime(ydl_opts: dict) -> None:
 
 
 def convert_youtube_leftovers(output_dir: Path) -> tuple[int, int]:
-    """Convert leftover YouTube .mp4 (+ .webp covers) into .m4a. Returns (ok, failed)."""
+    """Convert leftover YouTube .mp4 / .webm into .m4a. Returns (ok, failed)."""
     ffmpeg = resolve_ffmpeg()
     if not ffmpeg:
-        log("ffmpeg introuvable — impossible de convertir les .mp4")
+        log("ffmpeg introuvable — impossible de convertir les .mp4/.webm")
         return 0, 0
 
     ok = 0
     failed = 0
-    for mp4 in sorted(output_dir.glob("*.mp4")):
+    sources = sorted(
+        list(output_dir.glob("*.mp4")) + list(output_dir.glob("*.webm")),
+        key=lambda p: p.name,
+    )
+    for source in sources:
         if is_cancelled():
             break
-        m4a = mp4.with_suffix(".m4a")
-        if m4a.exists() and m4a.stat().st_size > 0:
-            mp4.unlink(missing_ok=True)
-            for side in (mp4.with_suffix(".webp"), mp4.with_suffix(".jpg"), mp4.with_suffix(".jpeg")):
-                side.unlink(missing_ok=True)
+        m4a = source.with_suffix(".m4a")
+        if m4a.exists() and m4a.stat().st_size > 0 and m4a != source:
+            source.unlink(missing_ok=True)
             ok += 1
             continue
 
         cover = None
         for ext in (".jpg", ".jpeg", ".webp", ".png"):
-            candidate = mp4.with_suffix(ext)
+            candidate = source.with_suffix(ext)
             if candidate.exists():
                 cover = candidate
                 break
 
-        cmd = [ffmpeg, "-y", "-i", str(mp4)]
+        cmd = [ffmpeg, "-y", "-i", str(source)]
         if cover is not None:
-            cmd += ["-i", str(cover), "-map", "0:a:0", "-map", "1:0", "-c:a", "copy", "-c:v", "mjpeg", "-disposition:v", "attached_pic"]
+            cmd += [
+                "-i",
+                str(cover),
+                "-map",
+                "0:a:0",
+                "-map",
+                "1:0",
+                "-c:a",
+                "copy",
+                "-c:v",
+                "mjpeg",
+                "-disposition:v",
+                "attached_pic",
+            ]
         else:
             cmd += ["-vn", "-c:a", "copy"]
         cmd.append(str(m4a))
 
-        # Some mp4s need re-encode if stream isn't AAC
         try:
             result = subprocess.run(cmd, capture_output=True, text=True, check=False)
             if result.returncode != 0 or not m4a.exists():
-                # Fallback: re-encode audio to AAC
-                cmd = [ffmpeg, "-y", "-i", str(mp4), "-vn", "-c:a", "aac", "-b:a", "192k", str(m4a)]
+                cmd = [
+                    ffmpeg,
+                    "-y",
+                    "-i",
+                    str(source),
+                    "-vn",
+                    "-c:a",
+                    "aac",
+                    "-b:a",
+                    "256k",
+                    str(m4a),
+                ]
                 result = subprocess.run(cmd, capture_output=True, text=True, check=False)
             if result.returncode == 0 and m4a.exists() and m4a.stat().st_size > 0:
-                mp4.unlink(missing_ok=True)
+                source.unlink(missing_ok=True)
                 if cover is not None:
                     cover.unlink(missing_ok=True)
-                for side in (mp4.with_suffix(".webp"), mp4.with_suffix(".jpg"), mp4.with_suffix(".jpeg")):
+                for side in (
+                    source.with_suffix(".webp"),
+                    source.with_suffix(".jpg"),
+                    source.with_suffix(".jpeg"),
+                ):
                     side.unlink(missing_ok=True)
                 ok += 1
-                # Quiet for batch conversions — summary is enough at the end.
             else:
                 failed += 1
-                log(f"Conversion échouée: {mp4.name}")
+                log(f"Conversion échouée: {source.name}")
         except Exception as exc:  # noqa: BLE001
             failed += 1
-            log(f"Conversion échouée: {mp4.name} ({exc})")
+            log(f"Conversion échouée: {source.name} ({exc})")
 
     cleanup_sidecar_images(output_dir)
     return ok, failed
 
 
+def convert_file_to_m4a(source: Path, dest: Path | None = None) -> Path | None:
+    """Convert a single audio/video file to .m4a."""
+    if not source.is_file():
+        return None
+    if source.suffix.lower() == ".m4a" and source.stat().st_size > 1024:
+        return source
+    ffmpeg = resolve_ffmpeg()
+    if not ffmpeg:
+        return None
+    dest = dest or source.with_suffix(".m4a")
+    cmd = [ffmpeg, "-y", "-i", str(source), "-vn", "-c:a", "aac", "-b:a", "256k", str(dest)]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=120)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode == 0 and dest.is_file() and dest.stat().st_size > 1024:
+        if dest != source:
+            source.unlink(missing_ok=True)
+        return dest
+    return None
+
+
+def purge_orphan_media(output_dir: Path, *, keep_stems: set[str] | None = None) -> None:
+    """Remove stray .webm/.mp4 and sidecars not matching kept Spotify stems."""
+    keep = keep_stems or set()
+    for ext in (".webm", ".mp4", ".webp", ".jpg", ".jpeg", ".png"):
+        for path in output_dir.glob(f"*{ext}"):
+            if not path.is_file():
+                continue
+            stem = path.stem
+            if keep and any(stem == k or stem.startswith(k) for k in keep):
+                continue
+            path.unlink(missing_ok=True)
+
+
 def classify_url(url: str) -> tuple[Platform, MediaKind] | None:
-    """Detect SoundCloud/YouTube and track vs playlist."""
+    """Detect SoundCloud/YouTube/Spotify and track vs playlist."""
     parsed = urlparse(url.strip())
     host = parsed.netloc.lower().removeprefix("www.")
     path = parsed.path or ""
@@ -409,11 +488,18 @@ def classify_url(url: str) -> tuple[Platform, MediaKind] | None:
             return "youtube", "playlist"
         return "youtube", "track"
 
+    spotify = parse_spotify_url(url)
+    if spotify:
+        kind, _sid = spotify
+        if kind in {"playlist", "album"}:
+            return "spotify", "playlist"
+        return "spotify", "track"
+
     return None
 
 
 def is_supported_media_url(url: str) -> bool:
-    return classify_url(url) is not None
+    return classify_url(url) is not None or is_spotify_url(url)
 
 
 def normalize_url(url: str) -> str:
@@ -428,6 +514,15 @@ def normalize_url(url: str) -> str:
     platform, kind = classified
     if platform == "soundcloud":
         # Drop ?in= / ?si= / utm — path alone identifies track or set.
+        return urlunparse(
+            (parsed.scheme or "https", parsed.netloc, parsed.path, "", "", "")
+        )
+
+    if platform == "spotify":
+        spotify = parse_spotify_url(url)
+        if spotify:
+            kind_sp, sid = spotify
+            return f"https://open.spotify.com/{kind_sp}/{sid}"
         return urlunparse(
             (parsed.scheme or "https", parsed.netloc, parsed.path, "", "", "")
         )
@@ -479,11 +574,11 @@ def entry_media_url(entry: dict[str, Any], platform: Platform) -> str | None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Download SoundCloud or YouTube tracks and playlists.",
+        description="Download SoundCloud, YouTube, or Spotify (search) tracks and playlists.",
     )
     parser.add_argument(
         "url",
-        help="SoundCloud or YouTube URL (track or playlist)",
+        help="SoundCloud, YouTube, or Spotify URL (track or playlist)",
     )
     parser.add_argument(
         "-o",
@@ -544,6 +639,15 @@ def build_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="If SoundCloud fails, search YouTube and download the best match (default: on).",
+    )
+    parser.add_argument(
+        "--quality-max",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Verify bitrate/duration after download and try alternate SoundCloud/YouTube "
+            "matches when quality is low (default: on)."
+        ),
     )
     return parser
 
@@ -749,6 +853,12 @@ def is_track_downloaded(
     entry: dict[str, Any],
     title_map: dict[str, str],
 ) -> bool:
+    target_stem = entry.get("_target_stem")
+    if target_stem:
+        final = output_dir / f"{target_stem}.m4a"
+        if final.is_file() and final.stat().st_size > 1024:
+            return True
+
     track_id = str(entry.get("id") or "")
     archive = archive_path(output_dir)
 
@@ -909,12 +1019,16 @@ def cleanup_sidecar_images(output_dir: Path) -> None:
 
 
 def fetch_playlist_display_name(url: str) -> str | None:
-    """Return a title for folder naming (track, set, or YouTube)."""
+    """Return a title for folder naming (track, set, YouTube, or Spotify)."""
     url = normalize_url(url)
     classified = classify_url(url)
     if classified is None:
         return None
     platform, _kind = classified
+
+    if platform == "spotify":
+        catalog = fetch_spotify_catalog(url)
+        return catalog.name if catalog else None
 
     if platform == "soundcloud":
         client_id = soundcloud_client_id()
@@ -1054,6 +1168,431 @@ def parse_item_range(items: str | None, total: int) -> set[int] | None:
     return {index for index in selected if 1 <= index <= total}
 
 
+def list_search_candidates(
+    prefix: str,
+    query: str,
+    n: int,
+    base_opts: dict,
+) -> list[dict[str, Any]]:
+    """Flat-search SoundCloud (scsearch) or YouTube (ytsearch)."""
+    if not query or n < 1:
+        return []
+    opts = {
+        **worker_ydl_opts(base_opts),
+        "quiet": True,
+        "no_warnings": True,
+        "extract_flat": True,
+        "skip_download": True,
+        "noplaylist": True,
+    }
+    if prefix.startswith("yt"):
+        apply_js_runtime(opts)
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(f"{prefix}{n}:{query}", download=False)
+    except Exception:  # noqa: BLE001
+        return []
+    if not isinstance(info, dict):
+        return []
+    entries = info.get("entries") or []
+    return [e for e in entries if isinstance(e, dict) and e]
+
+
+def candidate_url(entry: dict[str, Any], *, youtube: bool) -> str | None:
+    url = entry.get("webpage_url") or entry.get("url") or entry.get("id")
+    if not url:
+        return None
+    url = str(url)
+    if youtube and not url.startswith("http"):
+        return f"https://www.youtube.com/watch?v={url}"
+    if not youtube and url.startswith("http") is False and "/" not in url:
+        # SoundCloud flat id alone is not enough
+        return None
+    return url
+
+
+def evaluate_new_file(
+    output_dir: Path,
+    before: set[str],
+    *,
+    expected_duration: float | None,
+) -> tuple[Path | None, Any]:
+    path = newest_audio_file(output_dir, before)
+    if path is None:
+        return None, None
+    if path.suffix.lower() in {".webm", ".mp4"}:
+        converted = convert_file_to_m4a(path)
+        if converted:
+            path = converted
+    probe = resolve_ffprobe_bin(resolve_ffmpeg_dir())
+    quality = analyze_audio(path, ffprobe=probe)
+    return path, quality
+
+
+def _finalize_track_file(
+    best_path: Path,
+    output_dir: Path,
+    target_stem: str | None,
+) -> Path:
+    """Copy best temp download to final Spotify-style filename."""
+    if not best_path.is_file():
+        raise FileNotFoundError(best_path)
+    if not target_stem:
+        return best_path
+    final = output_dir / f"{target_stem}.m4a"
+    if final.exists():
+        final.unlink(missing_ok=True)
+    if best_path.suffix.lower() != ".m4a":
+        converted = convert_file_to_m4a(best_path, final)
+        if converted:
+            return converted
+    shutil.copy2(best_path, final)
+    return final
+
+
+def _persist_best_copy(src: Path, hold: Path) -> Path | None:
+    """Copy a candidate into a stable hold file (survives temp cleanup between attempts)."""
+    if not src.is_file():
+        return None
+    if src.suffix.lower() != ".m4a":
+        converted = convert_file_to_m4a(src, hold)
+        if converted:
+            return hold
+    shutil.copy2(src, hold)
+    return hold
+
+
+def download_search_with_quality(
+    *,
+    index: int,
+    total: int,
+    query: str,
+    expected_duration: float | None,
+    output_dir: Path,
+    base_opts: dict,
+    audio_format: str,
+    quality_max: bool,
+    prefer_soundcloud: bool = True,
+    expected_title: str | None = None,
+    expected_artists: str | None = None,
+    target_stem: str | None = None,
+    strict_match: bool = False,
+    extra_queries: list[str] | None = None,
+) -> ResultKind:
+    """Search SC/YT in an isolated temp dir; keep one .m4a with clean name."""
+    n = 5 if quality_max else 3
+    max_attempts = 5 if quality_max else 3
+    strict = strict_match or bool(target_stem)
+
+    queries: list[str] = []
+    for q in [query, *(extra_queries or [])]:
+        q = (q or "").strip()
+        if q and q not in queries:
+            queries.append(q)
+    if not queries:
+        log(f"[{index:02d}/{total}] Pas de requête de recherche.")
+        return "failed"
+
+    candidates: list[tuple[str, dict[str, Any]]] = []
+    seen_ids: set[str] = set()
+    for q in queries[:4]:
+        if prefer_soundcloud:
+            for entry in list_search_candidates("scsearch", q, n, base_opts):
+                eid = str(entry.get("id") or entry.get("url") or entry.get("title") or "")
+                key = f"sc:{eid}"
+                if key in seen_ids:
+                    continue
+                seen_ids.add(key)
+                candidates.append(("soundcloud", entry))
+        for entry in list_search_candidates("ytsearch", q, n, base_opts):
+            eid = str(entry.get("id") or entry.get("url") or entry.get("title") or "")
+            key = f"yt:{eid}"
+            if key in seen_ids:
+                continue
+            seen_ids.add(key)
+            candidates.append(("youtube", entry))
+
+    accept_strict = strict
+    sc = rank_search_candidates(
+        [e for s, e in candidates if s == "soundcloud"],
+        query=queries[0],
+        expected_duration=expected_duration,
+        expected_title=expected_title,
+        expected_artists=expected_artists,
+        strict=accept_strict,
+    )
+    yt = rank_search_candidates(
+        [e for s, e in candidates if s == "youtube"],
+        query=queries[0],
+        expected_duration=expected_duration,
+        expected_title=expected_title,
+        expected_artists=expected_artists,
+        strict=accept_strict,
+    )
+    if not sc and not yt and strict:
+        log(f"[{index:02d}/{total}] Filtre strict vide — élargissement…")
+        accept_strict = False
+        sc = rank_search_candidates(
+            [e for s, e in candidates if s == "soundcloud"],
+            query=queries[0],
+            expected_duration=expected_duration,
+            expected_title=expected_title,
+            expected_artists=expected_artists,
+            strict=False,
+        )
+        yt = rank_search_candidates(
+            [e for s, e in candidates if s == "youtube"],
+            query=queries[0],
+            expected_duration=expected_duration,
+            expected_title=expected_title,
+            expected_artists=expected_artists,
+            strict=False,
+        )
+    ordered: list[tuple[str, dict[str, Any]]] = []
+    if prefer_soundcloud:
+        for i in range(max(len(sc), len(yt))):
+            if i < len(sc):
+                ordered.append(("soundcloud", sc[i]))
+            if i < len(yt):
+                ordered.append(("youtube", yt[i]))
+    else:
+        for i in range(max(len(sc), len(yt))):
+            if i < len(yt):
+                ordered.append(("youtube", yt[i]))
+            if i < len(sc):
+                ordered.append(("soundcloud", sc[i]))
+
+    if not ordered:
+        log(f"[{index:02d}/{total}] Aucun résultat acceptable pour: {queries[0]}")
+        return "failed"
+
+    best_path: Path | None = None
+    best_score = -1.0
+    best_kind: ResultKind = "failed"
+    best_summary = ""
+    tried = 0
+    hold_file = "_best.m4a"
+
+    temp_dir = Path(tempfile.mkdtemp(prefix="mtd-track-", dir=output_dir))
+    hold_path = temp_dir / hold_file
+    try:
+        for source, entry in ordered:
+            if tried >= max_attempts or is_cancelled():
+                break
+            url = candidate_url(entry, youtube=(source == "youtube"))
+            if not url:
+                continue
+            title = str(entry.get("title") or queries[0])
+            cand_dur = entry.get("duration")
+            try:
+                cand_dur_f = float(cand_dur) if cand_dur is not None else None
+            except (TypeError, ValueError):
+                cand_dur_f = None
+            if not candidate_acceptable(
+                title,
+                expected_title=expected_title,
+                expected_artists=expected_artists,
+                duration=cand_dur_f,
+                expected_duration=expected_duration,
+                strict=accept_strict,
+            ):
+                continue
+
+            tried += 1
+            log(f"[{index:02d}/{total}] Essai {source}: {title}")
+
+            for old in temp_dir.iterdir():
+                if old.is_file() and old.name != hold_file:
+                    old.unlink(missing_ok=True)
+
+            before = snapshot_audio_names(temp_dir)
+            output_template = str(temp_dir / "dl.%(ext)s")
+            try:
+                ok = download_url(
+                    url,
+                    output_template,
+                    base_opts,
+                    youtube=(source == "youtube"),
+                    soundcloud=(source == "soundcloud"),
+                    audio_format=audio_format,
+                )
+            except CancelledError:
+                return "cancelled"
+            if not ok:
+                continue
+
+            cleanup_sidecar_images(temp_dir)
+            path, quality = evaluate_new_file(
+                temp_dir, before, expected_duration=expected_duration
+            )
+            if path is None:
+                continue
+
+            if quality and expected_duration and quality.duration_sec:
+                post_ok = candidate_acceptable(
+                    title,
+                    expected_title=expected_title,
+                    expected_artists=expected_artists,
+                    duration=quality.duration_sec,
+                    expected_duration=expected_duration,
+                    strict=accept_strict,
+                )
+                if not post_ok:
+                    if path != hold_path and path.exists():
+                        path.unlink(missing_ok=True)
+                    log(f"[{index:02d}/{total}]   ↳ rejeté après analyse ({quality.summary()})")
+                    continue
+
+            score = (
+                quality_score(quality, expected_duration=expected_duration)
+                if quality
+                else 0.4
+            )
+            summary = quality.summary() if quality else "qualité inconnue"
+            log(f"[{index:02d}/{total}]   ↳ {summary} (score {score:.2f})")
+
+            if score > best_score:
+                saved = _persist_best_copy(path, hold_path)
+                if saved:
+                    best_path = saved
+                    best_score = score
+                    best_kind = "soundcloud" if source == "soundcloud" else "youtube"
+                    best_summary = summary
+            elif path != hold_path and path.exists():
+                path.unlink(missing_ok=True)
+
+            if quality and meets_min_quality(
+                quality, expected_duration=expected_duration, strict=accept_strict
+            ):
+                break
+
+        if best_path is None or not best_path.is_file():
+            log(f"[{index:02d}/{total}] Échec recherche: {queries[0]}")
+            return "failed"
+
+        if accept_strict and best_score < 0.55:
+            log(f"[{index:02d}/{total}] Aucune version fiable (score {best_score:.2f})")
+            return "failed"
+
+        try:
+            final_path = _finalize_track_file(best_path, output_dir, target_stem)
+        except OSError as exc:
+            log(f"[{index:02d}/{total}] Erreur enregistrement: {exc}")
+            return "failed"
+        warn = " ⚠ qualité moyenne" if best_score < 0.65 else ""
+        label = final_path.name if target_stem else best_summary
+        log(f"[{index:02d}/{total}] OK ({best_kind}) — {label}{warn}")
+        return best_kind
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def verify_or_upgrade_download(
+    *,
+    index: int,
+    total: int,
+    path: Path | None,
+    quality: Any,
+    query: str | None,
+    expected_duration: float | None,
+    output_dir: Path,
+    base_opts: dict,
+    audio_format: str,
+    quality_max: bool,
+    current_kind: ResultKind,
+) -> ResultKind:
+    """If quality is low, try search upgrades when quality_max is on."""
+    if not quality_max or not query:
+        if path and quality:
+            log(f"[{index:02d}/{total}] OK ({current_kind}) — {quality.summary()}")
+        elif path:
+            log(f"[{index:02d}/{total}] OK ({current_kind})")
+        return current_kind
+
+    if quality and meets_min_quality(
+        quality, expected_duration=expected_duration, strict=True
+    ):
+        log(f"[{index:02d}/{total}] OK ({current_kind}) — {quality.summary()}")
+        return current_kind
+
+    if quality:
+        log(
+            f"[{index:02d}/{total}] Qualité faible ({quality.summary()}) — "
+            "recherche d’une meilleure version…"
+        )
+    else:
+        log(f"[{index:02d}/{total}] Qualité inconnue — recherche d’une meilleure version…")
+
+    baseline_score = (
+        quality_score(quality, expected_duration=expected_duration) if quality else 0.0
+    )
+    # Move baseline aside so search can produce a clean "best" file
+    baseline_backup: Path | None = None
+    if path and path.exists():
+        baseline_backup = path.with_name(f".baseline-{path.name}")
+        try:
+            path.replace(baseline_backup)
+        except OSError:
+            baseline_backup = None
+
+    upgraded = download_search_with_quality(
+        index=index,
+        total=total,
+        query=query,
+        expected_duration=expected_duration,
+        output_dir=output_dir,
+        base_opts=base_opts,
+        audio_format=audio_format,
+        quality_max=True,
+        prefer_soundcloud=True,
+    )
+
+    if upgraded in {"soundcloud", "youtube"}:
+        if baseline_backup and baseline_backup.exists():
+            probe = resolve_ffprobe_bin(resolve_ffmpeg_dir())
+            new_files = [
+                p
+                for p in output_dir.iterdir()
+                if p.is_file()
+                and p.suffix.lower()
+                in {".m4a", ".mp3", ".opus", ".wav", ".flac", ".aac", ".mp4"}
+                and not p.name.startswith(".baseline-")
+            ]
+            best_new = None
+            best_new_score = -1.0
+            for cand in new_files:
+                q = analyze_audio(cand, ffprobe=probe)
+                sc = quality_score(q, expected_duration=expected_duration) if q else 0.0
+                if sc > best_new_score:
+                    best_new_score = sc
+                    best_new = cand
+            if best_new is not None and best_new_score >= baseline_score:
+                baseline_backup.unlink(missing_ok=True)
+                return upgraded
+            # Revert to baseline
+            for cand in new_files:
+                cand.unlink(missing_ok=True)
+            try:
+                baseline_backup.replace(path)  # type: ignore[arg-type]
+            except OSError:
+                pass
+            log(
+                f"[{index:02d}/{total}] Meilleure version introuvable — "
+                f"on garde l’originale ({baseline_score:.2f})"
+            )
+            return current_kind
+        return upgraded
+
+    if baseline_backup and baseline_backup.exists() and path:
+        try:
+            baseline_backup.replace(path)
+        except OSError:
+            pass
+        log(f"[{index:02d}/{total}] On garde la version initiale ({baseline_score:.2f})")
+        return current_kind
+    return "failed"
+
+
 def process_track(
     *,
     index: int,
@@ -1066,9 +1605,49 @@ def process_track(
     title_map: dict[str, str],
     track_meta: dict[str, dict[str, str]],
     platform: Platform,
+    quality_max: bool = True,
 ) -> ResultKind:
     if is_cancelled():
         return "cancelled"
+
+    expected_duration: float | None = None
+    raw_dur = entry.get("_expected_duration") or entry.get("duration")
+    try:
+        if raw_dur is not None:
+            expected_duration = float(raw_dur)
+    except (TypeError, ValueError):
+        expected_duration = None
+
+    # Spotify (and generic search entries): never download from Spotify itself
+    if platform == "spotify":
+        query = str(entry.get("_spotify_query") or entry.get("title") or "").strip()
+        if not query:
+            log(f"[{index:02d}/{total}] Pas de titre Spotify, ignoré.")
+            return "failed"
+        expected_title = str(entry.get("track") or "")
+        expected_artists = str(entry.get("artist") or "")
+        target_stem = str(entry.get("_target_stem") or "")
+        if not target_stem and expected_title:
+            target_stem = sanitize_filename_stem(expected_artists, expected_title)
+        extra = entry.get("_spotify_queries")
+        extra_queries = [str(q) for q in extra] if isinstance(extra, list) else None
+        log(f"[{index:02d}/{total}] Spotify → {target_stem or query}")
+        return download_search_with_quality(
+            index=index,
+            total=total,
+            query=query,
+            expected_duration=expected_duration,
+            output_dir=output_dir,
+            base_opts=base_opts,
+            audio_format=audio_format,
+            quality_max=quality_max,
+            prefer_soundcloud=True,
+            expected_title=expected_title or None,
+            expected_artists=expected_artists or None,
+            target_stem=target_stem or None,
+            strict_match=True,
+            extra_queries=extra_queries,
+        )
 
     track_id = str(entry.get("id") or "")
     track_url = entry_media_url(entry, platform)
@@ -1082,10 +1661,12 @@ def process_track(
         return "failed"
 
     output_template = str(output_dir / "%(title)s.%(ext)s")
+    query = youtube_search_query(entry, title_map, track_meta)
 
     # Native YouTube link (video or playlist item)
     if platform == "youtube":
         log(f"[{index:02d}/{total}] YouTube: {track_url}")
+        before = snapshot_audio_names(output_dir)
         try:
             if download_url(
                 track_url,
@@ -1095,7 +1676,32 @@ def process_track(
                 audio_format=audio_format,
             ):
                 cleanup_sidecar_images(output_dir)
-                log(f"[{index:02d}/{total}] OK (YouTube)")
+                path, quality = evaluate_new_file(
+                    output_dir, before, expected_duration=expected_duration
+                )
+                if quality_max and query and (
+                    quality is None
+                    or not meets_min_quality(
+                        quality, expected_duration=expected_duration, strict=True
+                    )
+                ):
+                    return verify_or_upgrade_download(
+                        index=index,
+                        total=total,
+                        path=path,
+                        quality=quality,
+                        query=query,
+                        expected_duration=expected_duration,
+                        output_dir=output_dir,
+                        base_opts=base_opts,
+                        audio_format=audio_format,
+                        quality_max=quality_max,
+                        current_kind="youtube",
+                    )
+                if quality:
+                    log(f"[{index:02d}/{total}] OK (YouTube) — {quality.summary()}")
+                else:
+                    log(f"[{index:02d}/{total}] OK (YouTube)")
                 return "youtube"
         except CancelledError:
             log(f"[{index:02d}/{total}] Arrêté.")
@@ -1103,13 +1709,19 @@ def process_track(
         log(f"[{index:02d}/{total}] Échec YouTube.")
         return "failed"
 
-    # SoundCloud (with optional YouTube fallback)
+    # SoundCloud (with optional YouTube / quality search fallback)
     log(f"[{index:02d}/{total}] SoundCloud: {track_url}")
+    before = snapshot_audio_names(output_dir)
+    sc_ok = False
+    path = None
+    quality = None
     try:
         if download_url(track_url, output_template, base_opts, soundcloud=True):
             cleanup_sidecar_images(output_dir)
-            log(f"[{index:02d}/{total}] OK (SoundCloud)")
-            return "soundcloud"
+            path, quality = evaluate_new_file(
+                output_dir, before, expected_duration=expected_duration
+            )
+            sc_ok = True
     except CancelledError:
         log(f"[{index:02d}/{total}] Arrêté.")
         return "cancelled"
@@ -1117,34 +1729,52 @@ def process_track(
     if is_cancelled():
         return "cancelled"
 
+    if sc_ok:
+        if quality_max and query and (
+            quality is None
+            or not meets_min_quality(
+                quality, expected_duration=expected_duration, strict=False
+            )
+        ):
+            return verify_or_upgrade_download(
+                index=index,
+                total=total,
+                path=path,
+                quality=quality,
+                query=query,
+                expected_duration=expected_duration,
+                output_dir=output_dir,
+                base_opts=base_opts,
+                audio_format=audio_format,
+                quality_max=quality_max,
+                current_kind="soundcloud",
+            )
+        if quality:
+            log(f"[{index:02d}/{total}] OK (SoundCloud) — {quality.summary()}")
+        else:
+            log(f"[{index:02d}/{total}] OK (SoundCloud)")
+        return "soundcloud"
+
     if not youtube_fallback:
         log(f"[{index:02d}/{total}] Échec SoundCloud.")
         return "failed"
 
-    query = youtube_search_query(entry, title_map, track_meta)
     if not query:
         log(f"[{index:02d}/{total}] Échec SoundCloud, pas de requête YouTube.")
         return "failed"
 
-    youtube_url = f"ytsearch1:{query}"
-    log(f"[{index:02d}/{total}] Secours YouTube: {query}")
-    try:
-        if download_url(
-            youtube_url,
-            output_template,
-            base_opts,
-            youtube=True,
-            audio_format=audio_format,
-        ):
-            cleanup_sidecar_images(output_dir)
-            log(f"[{index:02d}/{total}] OK (YouTube)")
-            return "youtube"
-    except CancelledError:
-        log(f"[{index:02d}/{total}] Arrêté.")
-        return "cancelled"
-
-    log(f"[{index:02d}/{total}] Secours YouTube échoué.")
-    return "failed"
+    log(f"[{index:02d}/{total}] Secours recherche: {query}")
+    return download_search_with_quality(
+        index=index,
+        total=total,
+        query=query,
+        expected_duration=expected_duration,
+        output_dir=output_dir,
+        base_opts=base_opts,
+        audio_format=audio_format,
+        quality_max=quality_max,
+        prefer_soundcloud=False,
+    )
 
 
 def download_playlist(
@@ -1158,6 +1788,7 @@ def download_playlist(
     skip_existing: bool = False,
     youtube_fallback: bool = True,
     jobs: int = 4,
+    quality_max: bool = True,
 ) -> int:
     clear_cancel()
     global _worker_cookie_counter
@@ -1166,15 +1797,17 @@ def download_playlist(
     url = normalize_url(url)
     classified = classify_url(url)
     if classified is None:
-        log("URL non supportée. Utilise un lien SoundCloud ou YouTube.")
+        log("URL non supportée. Utilise un lien SoundCloud, YouTube ou Spotify.")
         return 1
     platform, kind = classified
 
     output_dir.mkdir(parents=True, exist_ok=True)
     jobs = max(1, min(jobs, 12))
-    # YouTube rate-limits aggressive parallel downloads.
+    # YouTube / Spotify searches rate-limit aggressive parallel downloads.
     if platform == "youtube":
         jobs = min(jobs, 4)
+    elif platform == "spotify":
+        jobs = 1  # one track at a time — isolated temp dirs + clean filenames
     elif platform == "soundcloud":
         # SoundCloud rate-limits bursts — keep parallelism low.
         jobs = min(jobs, 2 if (browser or cookies or oauth_token) else 3)
@@ -1205,12 +1838,12 @@ def download_playlist(
                         pass
                     temp_cookie_path = None
 
-    if platform == "youtube" and not cookie_file and not browser_for_auth:
+    if platform in {"youtube", "spotify"} and not cookie_file and not browser_for_auth:
         log(
             "YouTube exige souvent une connexion navigateur. "
             "Choisis Chrome (connecté à YouTube) pour éviter le blocage « not a bot »."
         )
-    if platform == "youtube" and not resolve_deno() and not shutil.which("node"):
+    if platform in {"youtube", "spotify"} and not resolve_deno() and not shutil.which("node"):
         log(
             "Attention: Deno manquant (nécessaire pour YouTube). "
             "Installe avec: brew install deno"
@@ -1220,109 +1853,130 @@ def download_playlist(
         log("Arrêté avant le début.")
         return 2
 
-    extract_opts: dict = {
-        "quiet": True,
-        "extract_flat": "in_playlist",
-        "ignoreerrors": True,
-    }
-    apply_ffmpeg(extract_opts)
-    if platform == "youtube":
-        apply_js_runtime(extract_opts)
-    # For a single YouTube watch URL, never expand an attached playlist.
-    if platform == "youtube" and kind == "track":
-        extract_opts["noplaylist"] = True
-
-    if cookie_file:
-        apply_auth(extract_opts, cookie_file, oauth_token if platform == "soundcloud" else None)
-    elif browser_for_auth:
-        extract_opts["cookiesfrombrowser"] = (browser_for_auth,)
-        apply_auth(
-            extract_opts,
-            None,
-            oauth_token if platform == "soundcloud" else None,
-        )
-    else:
-        apply_auth(extract_opts, None, oauth_token if platform == "soundcloud" else None)
-
-    try:
-        with yt_dlp.YoutubeDL(extract_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-    except Exception as exc:  # noqa: BLE001
-        err_text = str(exc).lower()
-        # Safari / TCC sometimes fails only at extract time.
-        if browser_for_auth and (
-            "cookie" in err_text or "not permitted" in err_text
-        ):
-            explain_cookie_failure(browser_for_auth, exc)
-            browser_for_auth = None
-            extract_opts.pop("cookiesfrombrowser", None)
-            extract_opts.pop("cookiefile", None)
-            apply_auth(extract_opts, None, oauth_token)
-            with yt_dlp.YoutubeDL(extract_opts) as ydl:
-                info = ydl.extract_info(url, download=False)
-        elif cookie_file and (
-            "expecting value" in err_text
-            or "403" in err_text
-            or "cookie" in err_text
-            or "netscape" in err_text
-        ):
-            log("Cookies navigateur invalides — lecture de la playlist sans cookies.")
-            cookie_file = None
-            browser_for_auth = None
-            extract_opts.pop("cookiefile", None)
-            extract_opts.pop("cookiesfrombrowser", None)
-            apply_auth(extract_opts, None, oauth_token if platform == "soundcloud" else None)
-            with yt_dlp.YoutubeDL(extract_opts) as ydl:
-                info = ydl.extract_info(url, download=False)
-        else:
-            log(f"Erreur : {exc}")
-            return 1
-
-    if not info:
-        log("Impossible de lire le lien.")
-        return 1
-
-    entries = entries_from_info(info)
-    if not entries:
-        log("Aucun média trouvé.")
-        return 1
-
-    # Prefer stable permalink for single SoundCloud tracks (flat extract can be a temp stream).
-    if platform == "soundcloud" and kind == "track":
-        entries[0]["url"] = url
-        entries[0]["webpage_url"] = url
-
-    selected = parse_item_range(items, len(entries))
+    entries: list[dict[str, Any]] = []
     track_meta: dict[str, dict[str, str]] = {}
     title_map: dict[str, str] = {}
-    if platform == "soundcloud" and kind == "playlist":
-        track_meta = fetch_playlist_track_meta(url)
-        title_map = {
-            track_id: meta["title"]
-            for track_id, meta in track_meta.items()
-            if meta.get("title")
-        }
-        if track_meta:
-            log(f"Métadonnées SoundCloud: {len(track_meta)} pistes.")
-        elif youtube_fallback:
+    spotify_playlist_name: str | None = None
+
+    if platform == "spotify":
+        log("Spotify: lecture des métadonnées (pas de téléchargement depuis Spotify)…")
+        catalog = fetch_spotify_catalog(url)
+        if not catalog or not catalog.tracks:
             log(
-                "Attention: métadonnées SoundCloud indisponibles; "
-                "le secours YouTube peut manquer des titres."
+                "Impossible de lire la playlist Spotify. "
+                "Vérifie que le lien est public, puis réessaie."
             )
-    elif platform == "soundcloud" and kind == "track":
-        # Enrich single-track entry when flat extract is sparse.
-        track_id = str(entries[0].get("id") or "")
-        if track_id and not entries[0].get("title"):
-            resolved_title = fetch_playlist_display_name(url)
-            if resolved_title:
-                entries[0]["title"] = resolved_title
-                title_map[track_id] = resolved_title
+            return 1
+        spotify_playlist_name = catalog.name
+        entries = spotify_tracks_as_entries(catalog)
+        log(f"Playlist Spotify « {catalog.name} » — {len(entries)} piste(s).")
+        if len(entries) >= 100:
+            log(
+                "Note: l’embed Spotify peut tronquer les très longues playlists "
+                "(~100 premiers titres)."
+            )
+    else:
+        extract_opts: dict = {
+            "quiet": True,
+            "extract_flat": "in_playlist",
+            "ignoreerrors": True,
+        }
+        apply_ffmpeg(extract_opts)
+        if platform == "youtube":
+            apply_js_runtime(extract_opts)
+        # For a single YouTube watch URL, never expand an attached playlist.
+        if platform == "youtube" and kind == "track":
+            extract_opts["noplaylist"] = True
 
-    use_fallback = youtube_fallback and platform == "soundcloud"
+        if cookie_file:
+            apply_auth(extract_opts, cookie_file, oauth_token if platform == "soundcloud" else None)
+        elif browser_for_auth:
+            extract_opts["cookiesfrombrowser"] = (browser_for_auth,)
+            apply_auth(
+                extract_opts,
+                None,
+                oauth_token if platform == "soundcloud" else None,
+            )
+        else:
+            apply_auth(extract_opts, None, oauth_token if platform == "soundcloud" else None)
 
-    if use_fallback and not has_real_ffprobe():
+        try:
+            with yt_dlp.YoutubeDL(extract_opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+        except Exception as exc:  # noqa: BLE001
+            err_text = str(exc).lower()
+            # Safari / TCC sometimes fails only at extract time.
+            if browser_for_auth and (
+                "cookie" in err_text or "not permitted" in err_text
+            ):
+                explain_cookie_failure(browser_for_auth, exc)
+                browser_for_auth = None
+                extract_opts.pop("cookiesfrombrowser", None)
+                extract_opts.pop("cookiefile", None)
+                apply_auth(extract_opts, None, oauth_token)
+                with yt_dlp.YoutubeDL(extract_opts) as ydl:
+                    info = ydl.extract_info(url, download=False)
+            elif cookie_file and (
+                "expecting value" in err_text
+                or "403" in err_text
+                or "cookie" in err_text
+                or "netscape" in err_text
+            ):
+                log("Cookies navigateur invalides — lecture de la playlist sans cookies.")
+                cookie_file = None
+                browser_for_auth = None
+                extract_opts.pop("cookiefile", None)
+                extract_opts.pop("cookiesfrombrowser", None)
+                apply_auth(extract_opts, None, oauth_token if platform == "soundcloud" else None)
+                with yt_dlp.YoutubeDL(extract_opts) as ydl:
+                    info = ydl.extract_info(url, download=False)
+            else:
+                log(f"Erreur : {exc}")
+                return 1
+
+        if not info:
+            log("Impossible de lire le lien.")
+            return 1
+
+        entries = entries_from_info(info)
+        if not entries:
+            log("Aucun média trouvé.")
+            return 1
+
+        # Prefer stable permalink for single SoundCloud tracks (flat extract can be a temp stream).
+        if platform == "soundcloud" and kind == "track":
+            entries[0]["url"] = url
+            entries[0]["webpage_url"] = url
+
+        if platform == "soundcloud" and kind == "playlist":
+            track_meta = fetch_playlist_track_meta(url)
+            title_map = {
+                track_id: meta["title"]
+                for track_id, meta in track_meta.items()
+                if meta.get("title")
+            }
+            if track_meta:
+                log(f"Métadonnées SoundCloud: {len(track_meta)} pistes.")
+            elif youtube_fallback:
+                log(
+                    "Attention: métadonnées SoundCloud indisponibles; "
+                    "le secours YouTube peut manquer des titres."
+                )
+        elif platform == "soundcloud" and kind == "track":
+            # Enrich single-track entry when flat extract is sparse.
+            track_id = str(entries[0].get("id") or "")
+            if track_id and not entries[0].get("title"):
+                resolved_title = fetch_playlist_display_name(url)
+                if resolved_title:
+                    entries[0]["title"] = resolved_title
+                    title_map[track_id] = resolved_title
+
+    selected = parse_item_range(items, len(entries))
+    use_fallback = youtube_fallback and platform in {"soundcloud", "spotify"}
+
+    if (use_fallback or quality_max or platform == "spotify") and not has_real_ffprobe():
         log(
-            "Note: ffprobe absent — secours YouTube sans pochette intégrée "
+            "Note: ffprobe absent — contrôle qualité limité "
             "(installe: brew install ffmpeg)."
         )
 
@@ -1342,11 +1996,17 @@ def download_playlist(
     else:
         apply_auth(base_opts, None, sc_oauth)
 
-    if platform == "soundcloud":
+    if platform in {"soundcloud", "spotify"}:
         apply_format(base_opts, audio_format)
 
     kind_fr = "playlist" if kind == "playlist" else "piste"
-    source_fr = "SoundCloud" if platform == "soundcloud" else "YouTube"
+    if platform == "soundcloud":
+        source_fr = "SoundCloud"
+    elif platform == "youtube":
+        source_fr = "YouTube"
+    else:
+        source_fr = "Spotify→SC/YT"
+
     if platform == "soundcloud":
         if cookie_file or oauth_token:
             auth_note = " (connecté — jusqu’à 256 kbps AAC avec Go+)"
@@ -1358,13 +2018,23 @@ def download_playlist(
             auth_note = " (sans compte — ~160 kbps public; secours YouTube actif)"
         fallback_note = " + secours YouTube" if use_fallback else ""
         quality_line = f"Qualité: {audio_format}{auth_note}{fallback_note}"
+    elif platform == "spotify":
+        quality_line = (
+            "Qualité: recherche SoundCloud/YouTube"
+            + (" + contrôle bitrate/durée" if quality_max else "")
+            + " (jamais depuis Spotify)"
+        )
     else:
         if cookie_file or browser_for_auth:
             quality_line = "Qualité: audio YouTube (cookies navigateur)"
         else:
             quality_line = "Qualité: audio YouTube (sans cookies — risque de blocage bot)"
+        if quality_max:
+            quality_line += " + contrôle qualité"
 
     log(f"Téléchargement ({source_fr} · {kind_fr}) → {output_dir.resolve()}")
+    if spotify_playlist_name:
+        log(f"Titre Spotify: {spotify_playlist_name}")
     log(quality_line)
     log(f"Téléchargements parallèles: {jobs}")
     log(f"URL: {url}\n")
@@ -1382,15 +2052,27 @@ def download_playlist(
 
     if platform == "soundcloud" and len(work_items) > 20:
         log("SoundCloud: ralentissement auto si trop de requêtes (429).")
+    if platform == "spotify":
+        log("Spotify: chaque piste est cherchée sur SoundCloud puis YouTube.")
 
     soundcloud_ok = 0
     youtube_ok = 0
     failed = 0
     cancelled = 0
+    failed_tracks: list[str] = []
+    index_to_label = {
+        index: str(
+            entry.get("_target_stem")
+            or entry.get("title")
+            or entry.get("_spotify_query")
+            or f"piste {index}"
+        )
+        for index, entry in work_items
+    }
 
     try:
         with ThreadPoolExecutor(max_workers=jobs) as pool:
-            futures = [
+            futures = {
                 pool.submit(
                     process_track,
                     index=index,
@@ -1403,10 +2085,12 @@ def download_playlist(
                     title_map=title_map,
                     track_meta=track_meta,
                     platform=platform,
-                )
+                    quality_max=quality_max,
+                ): index
                 for index, entry in work_items
-            ]
+            }
             for future in as_completed(futures):
+                track_index = futures[future]
                 if is_cancelled():
                     for pending in futures:
                         pending.cancel()
@@ -1417,6 +2101,8 @@ def download_playlist(
                     continue
                 except Exception as exc:  # noqa: BLE001 - one bad track must not crash the batch
                     failed += 1
+                    label = index_to_label.get(track_index, f"piste {track_index}")
+                    failed_tracks.append(f"[{track_index:02d}] {label}")
                     log(f"Erreur piste: {exc}")
                     continue
                 if result == "soundcloud":
@@ -1427,6 +2113,8 @@ def download_playlist(
                     cancelled += 1
                 elif result == "failed":
                     failed += 1
+                    label = index_to_label.get(track_index, f"piste {track_index}")
+                    failed_tracks.append(f"[{track_index:02d}] {label}")
     finally:
         if temp_cookie_path and temp_cookie_path.exists():
             workers_dir = temp_cookie_path.parent / "workers"
@@ -1440,24 +2128,52 @@ def download_playlist(
                 pass
 
     if cancelled or is_cancelled():
-        leftovers = list(output_dir.glob("*.mp4"))
+        leftovers = [
+            p
+            for p in output_dir.iterdir()
+            if p.is_file() and p.suffix.lower() in {".mp4", ".webm"}
+        ]
         if leftovers:
-            log(f"\nConversion des .mp4 restants ({len(leftovers)})…")
+            log(f"\nConversion des .mp4/.webm restants ({len(leftovers)})…")
             convert_youtube_leftovers(output_dir)
+        if failed_tracks:
+            log("\nPistes non téléchargées :")
+            for line in failed_tracks:
+                log(f"  ✗ {line}")
         log(
             f"\nArrêté. SoundCloud: {soundcloud_ok}, YouTube: {youtube_ok}, "
             f"échecs: {failed}, ignorés: {skipped}, annulés: {cancelled}."
         )
         return 2
 
-    leftovers = list(output_dir.glob("*.mp4"))
+    leftovers = [
+        p
+        for p in output_dir.iterdir()
+        if p.is_file() and p.suffix.lower() in {".mp4", ".webm"}
+    ]
     if leftovers:
-        log(f"\nConversion de {len(leftovers)} fichier(s) .mp4 → .m4a…")
+        log(f"\nConversion de {len(leftovers)} fichier(s) .mp4/.webm → .m4a…")
         conv_ok, conv_fail = convert_youtube_leftovers(output_dir)
         if conv_ok:
             youtube_ok += conv_ok
             failed = max(0, failed - conv_ok)
         failed += conv_fail
+
+    if platform == "spotify":
+        keep_stems = {
+            str(entry.get("_target_stem"))
+            for _, entry in work_items
+            if entry.get("_target_stem")
+        }
+        purge_orphan_media(output_dir, keep_stems=keep_stems)
+        m4a_count = len(list(output_dir.glob("*.m4a")))
+        log(f"Dossier final: {m4a_count} fichier(s) .m4a (playlist: {len(entries)} pistes).")
+
+    if failed_tracks:
+        log("\nPistes non téléchargées :")
+        for line in sorted(failed_tracks):
+            log(f"  ✗ {line}")
+        log("Astuce: décoche « Ignorer déjà téléchargés » et relance pour retenter seulement les manquants.")
 
     log(
         f"\nTerminé. SoundCloud: {soundcloud_ok}, YouTube: {youtube_ok}, "
@@ -1479,6 +2195,7 @@ def main(argv: list[str] | None = None) -> int:
         skip_existing=args.skip_existing,
         youtube_fallback=args.youtube_fallback,
         jobs=args.jobs,
+        quality_max=args.quality_max,
     )
 
 

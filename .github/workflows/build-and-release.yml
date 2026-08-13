@@ -170,8 +170,14 @@ jobs:
             **Personal use only — for your own music. No commercial use.**  
             See [LICENSE](../blob/main/LICENSE) and [README](../blob/main/README.md).
 
-            **Version:** `${{ needs.bump-version.outputs.version }}`  
-            Auto-bumped and built on push to `main`.
+            **Version:** `${{ needs.bump-version.outputs.version }}`
+
+            ### What’s new
+            - **Spotify playlists** — paste an open.spotify.com link; the app reads titles only, then searches SoundCloud / YouTube (never downloads from Spotify)
+            - **Qualité max** — checks bitrate / duration after download and retries better matches
+            - Clean filenames (`Artist - Title.m4a`), fewer wrong matches (mixes, visualizers, wrong songs)
+            - End-of-run list of **tracks that failed** so you can retry missing ones
+            - Converts leftover `.webm` / `.mp4` to `.m4a`
 
             | Platform | File |
             |----------|------|
@@ -183,6 +189,9 @@ jobs:
               `xattr -cr ~/Downloads/MusicTrackDownloader.app`
               then open the app (or right-click → Open)
             - **Windows:** unzip → `MusicTrackDownloader.exe` (SmartScreen → More info → Run anyway)
+
+            ### Tip
+            Use **Chrome** logged into YouTube for fewer bot blocks. Keep **Qualité max** on for USB / DJ use.
           files: |
             release-assets/MusicTrackDownloader-mac-arm64.zip
             release-assets/MusicTrackDownloader-win64.zip

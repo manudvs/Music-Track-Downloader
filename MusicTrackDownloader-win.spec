@@ -17,6 +17,8 @@ binaries = []
 hiddenimports = [
     "download_playlist",
     "version",
+    "audio_quality",
+    "spotify_meta",
     "certifi",
     "mutagen",
     "mutagen.mp4",

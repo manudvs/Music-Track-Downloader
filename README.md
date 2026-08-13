@@ -9,8 +9,8 @@ Desktop tool to download **music tracks and playlists** as audio files (e.g. for
 
 **Version:** see [`VERSION`](VERSION) (shown in the app as `v…`)
 
-**Supported today:** SoundCloud & YouTube (tracks + playlists)  
-**Planned (maybe):** Deezer, Spotify  
+**Supported today:** SoundCloud, YouTube & Spotify playlists (Spotify = metadata only → search SoundCloud/YouTube)  
+**Planned (maybe):** Deezer  
 
 ---
 
@@ -163,6 +163,8 @@ Requires Python 3.10+. Optional: `brew install ffmpeg deno`.
 | Tip | Why |
 |-----|-----|
 | Use **Chrome** logged into the service | Fewer blocks / better quality |
+| Enable **Qualité max** | Checks bitrate/duration and retries better SoundCloud/YouTube matches |
+| Paste a **Spotify** playlist link | Reads titles only, then searches SoundCloud/YouTube (never downloads from Spotify) |
 | Enable **Ignorer déjà téléchargés** on retry | Only missing tracks are fetched again |
 | Large SoundCloud sets are slower on purpose | Avoids HTTP 429 |
 
@@ -172,10 +174,10 @@ Requires Python 3.10+. Optional: `brew install ffmpeg deno`.
 
 - [x] SoundCloud tracks & playlists  
 - [x] YouTube tracks & playlists  
+- [x] Spotify playlists → search elsewhere + quality check  
 - [x] macOS + Windows packaging  
 - [x] Version display + update check  
 - [ ] Deezer (maybe)  
-- [ ] Spotify (maybe)  
 
 ---
 
@@ -185,6 +187,8 @@ Requires Python 3.10+. Optional: `brew install ffmpeg deno`.
 |------|------|
 | `app_gui.py` | Desktop UI |
 | `download_playlist.py` | Download engine |
+| `spotify_meta.py` | Spotify playlist/track metadata (no Spotify audio) |
+| `audio_quality.py` | ffprobe bitrate/duration checks + candidate ranking |
 | `version.py` / `VERSION` / `bump_version.py` | App name + auto version bump |
 | `build_app.sh` | macOS package |
 | `build_windows.ps1` | Windows package |
