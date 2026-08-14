@@ -29,13 +29,19 @@ import yt_dlp
 from audio_quality import (
     analyze_audio,
     candidate_acceptable,
+    candidate_uploader,
     duration_match_score,
+    identity_score,
     meets_min_quality,
+    MIN_IDENTITY_KEEP,
     newest_audio_file,
+    normalize_title_key,
+    primary_artist_tokens,
     quality_score,
     rank_search_candidates,
     resolve_ffprobe_bin,
     sanitize_filename_stem,
+    significant_words,
 )
 from spotify_meta import (
     fetch_spotify_catalog,
@@ -348,10 +354,139 @@ def apply_js_runtime(ydl_opts: dict) -> None:
     ydl_opts["js_runtimes"] = {"deno": {}}
 
 
-def convert_youtube_leftovers(output_dir: Path) -> tuple[int, int]:
-    """Convert leftover YouTube .mp4 / .webm into .m4a. Returns (ok, failed)."""
+def encode_dj_safe_m4a(source: Path, dest: Path) -> Path | None:
+    """Pioneer XDJ-RX3: AAC-LC CBR 256 kbps, 44.1 kHz stereo, faststart.
+
+    Encode on a local scratch disk, then copy to dest (USB ffmpeg writes often fail).
+    Scoring still uses the source download — this is the final export only.
+    """
+    if not source.is_file() or source.stat().st_size < 1024:
+        return None
     ffmpeg = resolve_ffmpeg()
     if not ffmpeg:
+        log("ffmpeg introuvable — impossible d’exporter en AAC DJ")
+        return None
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    scratch_root = Path(tempfile.gettempdir()) / "mtd-tracks"
+    scratch_root.mkdir(parents=True, exist_ok=True)
+    scratch_dir = Path(tempfile.mkdtemp(prefix="mtd-dj-", dir=str(scratch_root)))
+    scratch = scratch_dir / "export.m4a"
+    attempts = [
+        [
+            ffmpeg,
+            "-y",
+            "-i",
+            str(source),
+            "-vn",
+            "-map",
+            "0:a:0",
+            "-ac",
+            "2",
+            "-ar",
+            "44100",
+            "-c:a",
+            "aac",
+            "-profile:a",
+            "aac_low",
+            "-b:a",
+            "256k",
+            "-movflags",
+            "+faststart",
+            str(scratch),
+        ],
+        [
+            ffmpeg,
+            "-y",
+            "-i",
+            str(source),
+            "-vn",
+            "-ac",
+            "2",
+            "-ar",
+            "44100",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "256k",
+            "-movflags",
+            "+faststart",
+            str(scratch),
+        ],
+    ]
+    try:
+        for cmd in attempts:
+            try:
+                result = subprocess.run(
+                    cmd, capture_output=True, text=True, check=False, timeout=300
+                )
+            except (OSError, subprocess.TimeoutExpired):
+                continue
+            if result.returncode == 0 and scratch.is_file() and scratch.stat().st_size > 1024:
+                if dest.exists():
+                    dest.unlink(missing_ok=True)
+                shutil.copy2(scratch, dest)
+                if dest.is_file() and dest.stat().st_size > 1024:
+                    return dest
+        return None
+    finally:
+        shutil.rmtree(scratch_dir, ignore_errors=True)
+
+
+PIONEER_AAC_MAX_KBPS = 320.0
+
+
+def m4a_exceeds_pioneer_spec(path: Path, *, quality: Any | None = None) -> bool:
+    """True when an .m4a is outside Pioneer XDJ-RX3 AAC limits (16–320 kbps)."""
+    if path.suffix.lower() != ".m4a":
+        return False
+    q = quality if quality is not None else analyze_audio(path)
+    if q is None or q.bitrate_kbps is None:
+        return False
+    return q.bitrate_kbps > PIONEER_AAC_MAX_KBPS
+
+
+def refresh_overspec_m4a(path: Path) -> bool:
+    """Re-encode a USB/output .m4a that is above Pioneer AAC bitrate."""
+    if path.suffix.lower() != ".m4a" or not path.is_file():
+        return False
+    q = analyze_audio(path)
+    local_dir: Path | None = None
+    source = path
+    try:
+        if q is None:
+            local_dir = track_scratch_dir()
+            source = local_dir / path.name
+            shutil.copy2(path, source)
+            q = analyze_audio(source)
+        if not m4a_exceeds_pioneer_spec(path, quality=q):
+            return False
+        return encode_dj_safe_m4a(source, path) is not None
+    except OSError:
+        return False
+    finally:
+        if local_dir is not None:
+            shutil.rmtree(local_dir, ignore_errors=True)
+
+
+def refresh_overspec_exports(output_dir: Path) -> int:
+    """Fix existing YouTube dumps that stutter on RX3 (>320 kbps AAC)."""
+    if not output_dir.is_dir():
+        return 0
+    n = 0
+    for path in sorted(output_dir.glob("*.m4a")):
+        if is_cancelled():
+            break
+        if path.stat().st_size < 1024:
+            continue
+        if refresh_overspec_m4a(path):
+            n += 1
+            log(f"Recodage RX3: {path.name} → AAC-LC 256 kbps · 44,1 kHz")
+    return n
+
+
+def convert_youtube_leftovers(output_dir: Path) -> tuple[int, int]:
+    """Convert leftover YouTube .mp4 / .webm into DJ-safe .m4a. Returns (ok, failed)."""
+    if not resolve_ffmpeg():
         log("ffmpeg introuvable — impossible de convertir les .mp4/.webm")
         return 0, 0
 
@@ -365,71 +500,16 @@ def convert_youtube_leftovers(output_dir: Path) -> tuple[int, int]:
         if is_cancelled():
             break
         m4a = source.with_suffix(".m4a")
-        if m4a.exists() and m4a.stat().st_size > 0 and m4a != source:
+        encoded = encode_dj_safe_m4a(source, m4a)
+        if encoded:
             source.unlink(missing_ok=True)
+            for ext in (".jpg", ".jpeg", ".webp", ".png"):
+                side = source.with_suffix(ext)
+                side.unlink(missing_ok=True)
             ok += 1
-            continue
-
-        cover = None
-        for ext in (".jpg", ".jpeg", ".webp", ".png"):
-            candidate = source.with_suffix(ext)
-            if candidate.exists():
-                cover = candidate
-                break
-
-        cmd = [ffmpeg, "-y", "-i", str(source)]
-        if cover is not None:
-            cmd += [
-                "-i",
-                str(cover),
-                "-map",
-                "0:a:0",
-                "-map",
-                "1:0",
-                "-c:a",
-                "copy",
-                "-c:v",
-                "mjpeg",
-                "-disposition:v",
-                "attached_pic",
-            ]
         else:
-            cmd += ["-vn", "-c:a", "copy"]
-        cmd.append(str(m4a))
-
-        try:
-            result = subprocess.run(cmd, capture_output=True, text=True, check=False)
-            if result.returncode != 0 or not m4a.exists():
-                cmd = [
-                    ffmpeg,
-                    "-y",
-                    "-i",
-                    str(source),
-                    "-vn",
-                    "-c:a",
-                    "aac",
-                    "-b:a",
-                    "256k",
-                    str(m4a),
-                ]
-                result = subprocess.run(cmd, capture_output=True, text=True, check=False)
-            if result.returncode == 0 and m4a.exists() and m4a.stat().st_size > 0:
-                source.unlink(missing_ok=True)
-                if cover is not None:
-                    cover.unlink(missing_ok=True)
-                for side in (
-                    source.with_suffix(".webp"),
-                    source.with_suffix(".jpg"),
-                    source.with_suffix(".jpeg"),
-                ):
-                    side.unlink(missing_ok=True)
-                ok += 1
-            else:
-                failed += 1
-                log(f"Conversion échouée: {source.name}")
-        except Exception as exc:  # noqa: BLE001
             failed += 1
-            log(f"Conversion échouée: {source.name} ({exc})")
+            log(f"Conversion échouée: {source.name}")
 
     cleanup_sidecar_images(output_dir)
     return ok, failed
@@ -842,10 +922,63 @@ def archive_path(output_dir: Path) -> Path:
 def existing_audio_for_title(output_dir: Path, title: str) -> bool:
     """Match by exact filename stem so *, ?, [] in titles don't break glob."""
     audio_exts = {".m4a", ".mp3", ".opus", ".wav", ".flac", ".aac", ".mp4"}
+    wanted = title.casefold()
     for path in output_dir.iterdir():
-        if path.is_file() and path.suffix.lower() in audio_exts and path.stem == title:
+        if path.is_file() and path.suffix.lower() in audio_exts and path.stem.casefold() == wanted:
             return True
     return False
+
+
+def _safe_stem(left: str, right: str) -> str:
+    name = f"{left.strip()} - {right.strip()}" if right.strip() else left.strip()
+    name = re.sub(r'[<>:"/\\|?*\x00-\x1f#]', " ", name)
+    name = re.sub(r"\s+", " ", name).strip().rstrip(".")
+    return name[:120]
+
+
+def find_spotify_style_file(output_dir: Path, artist: str, title: str) -> Path | None:
+    """Recognize our names and Sidify-style 'Title - Artist' files."""
+    if not title.strip():
+        return None
+    audio_exts = {".m4a", ".mp3", ".opus", ".wav", ".flac", ".aac", ".mp4"}
+    primary = artist.split(",")[0].strip()
+    exact_keys = {
+        normalize_title_key(_safe_stem(artist, title)),
+        normalize_title_key(_safe_stem(primary, title)),
+        normalize_title_key(_safe_stem(title, artist)),
+        normalize_title_key(_safe_stem(title, primary)),
+        normalize_title_key(title),
+    }
+    exact_keys.discard("")
+    title_words = significant_words(title)
+    artist_toks = primary_artist_tokens(artist)
+
+    try:
+        files = list(output_dir.iterdir())
+    except OSError:
+        return None
+
+    for path in files:
+        if not path.is_file() or path.suffix.lower() not in audio_exts:
+            continue
+        if path.stat().st_size < 1024:
+            continue
+        key = normalize_title_key(path.stem)
+        if key in exact_keys:
+            return path
+        if not title_words:
+            continue
+        if not all(word in key for word in title_words):
+            continue
+        if artist_toks and not any(tok in key for tok in artist_toks):
+            continue
+        return path
+    return None
+
+
+def existing_file_for_spotify_track(output_dir: Path, artist: str, title: str) -> bool:
+    """Recognize our names and Sidify-style 'Title - Artist' files."""
+    return find_spotify_style_file(output_dir, artist, title) is not None
 
 
 def is_track_downloaded(
@@ -854,10 +987,24 @@ def is_track_downloaded(
     entry: dict[str, Any],
     title_map: dict[str, str],
 ) -> bool:
+    artist = str(entry.get("artist") or "")
+    track_title = str(entry.get("track") or "")
     target_stem = entry.get("_target_stem")
+    files = list(output_dir.iterdir()) if output_dir.is_dir() else []
     if target_stem:
-        final = output_dir / f"{target_stem}.m4a"
-        if final.is_file() and final.stat().st_size > 1024:
+        wanted = str(target_stem).casefold()
+        for path in files:
+            if (
+                path.is_file()
+                and path.suffix.lower() in {".m4a", ".mp3", ".opus", ".wav", ".flac", ".aac"}
+                and path.stem.casefold() == wanted
+                and path.stat().st_size > 1024
+            ):
+                return True
+    if artist or track_title:
+        if existing_file_for_spotify_track(
+            output_dir, artist, track_title or str(entry.get("title") or "")
+        ):
             return True
 
     track_id = str(entry.get("id") or "")
@@ -875,7 +1022,7 @@ def is_track_downloaded(
 
     # Legacy numbered filenames from earlier downloads.
     prefix = f"{index:02d} - "
-    for path in output_dir.iterdir():
+    for path in files:
         if path.is_file() and path.name.startswith(prefix):
             return True
     return False
@@ -1262,20 +1409,20 @@ def _finalize_track_file(
     output_dir: Path,
     target_stem: str | None,
 ) -> Path:
-    """Copy best temp download to final Spotify-style filename."""
+    """Export the chosen download as a Pioneer-safe AAC file."""
     if not best_path.is_file():
         raise FileNotFoundError(best_path)
-    if not target_stem:
-        return best_path
-    final = output_dir / f"{target_stem}.m4a"
-    if final.exists():
-        final.unlink(missing_ok=True)
-    if best_path.suffix.lower() != ".m4a":
-        converted = convert_file_to_m4a(best_path, final)
-        if converted:
-            return converted
-    shutil.copy2(best_path, final)
-    return final
+    dest = output_dir / f"{target_stem}.m4a" if target_stem else best_path.with_suffix(".m4a")
+    encoded = encode_dj_safe_m4a(best_path, dest)
+    if encoded:
+        return encoded
+    log(f"Export RX3 échoué pour {dest.name} — copie sans recodage")
+    if dest.resolve() != best_path.resolve():
+        if dest.exists():
+            dest.unlink(missing_ok=True)
+        shutil.copy2(best_path, dest)
+        return dest
+    return best_path
 
 
 def _persist_best_copy(src: Path, hold: Path) -> Path | None:
@@ -1308,8 +1455,8 @@ def download_search_with_quality(
     extra_queries: list[str] | None = None,
 ) -> ResultKind:
     """Search SC/YT in an isolated temp dir; keep one .m4a with clean name."""
-    n = 5 if quality_max else 3
-    max_attempts = 5 if quality_max else 3
+    n = 8 if quality_max else 5
+    max_attempts = 6 if quality_max else 3
     strict = strict_match or bool(target_stem)
 
     queries: list[str] = []
@@ -1323,7 +1470,7 @@ def download_search_with_quality(
 
     candidates: list[tuple[str, dict[str, Any]]] = []
     seen_ids: set[str] = set()
-    for q in queries[:4]:
+    for q in queries[:5]:
         if prefer_soundcloud:
             for entry in list_search_candidates("scsearch", q, n, base_opts):
                 eid = str(entry.get("id") or entry.get("url") or entry.get("title") or "")
@@ -1341,6 +1488,8 @@ def download_search_with_quality(
             candidates.append(("youtube", entry))
 
     accept_strict = strict
+    require_identity = strict
+    relax_duration = False
     sc = rank_search_candidates(
         [e for s, e in candidates if s == "soundcloud"],
         query=queries[0],
@@ -1348,6 +1497,8 @@ def download_search_with_quality(
         expected_title=expected_title,
         expected_artists=expected_artists,
         strict=accept_strict,
+        require_identity=require_identity,
+        relax_duration=relax_duration,
     )
     yt = rank_search_candidates(
         [e for s, e in candidates if s == "youtube"],
@@ -1356,10 +1507,14 @@ def download_search_with_quality(
         expected_title=expected_title,
         expected_artists=expected_artists,
         strict=accept_strict,
+        require_identity=require_identity,
+        relax_duration=relax_duration,
     )
     if not sc and not yt and strict:
-        log(f"[{index:02d}/{total}] Filtre strict vide — élargissement…")
+        log(f"[{index:02d}/{total}] Filtre strict vide — élargissement (identité conservée)…")
         accept_strict = False
+        require_identity = True
+        relax_duration = True
         sc = rank_search_candidates(
             [e for s, e in candidates if s == "soundcloud"],
             query=queries[0],
@@ -1367,6 +1522,8 @@ def download_search_with_quality(
             expected_title=expected_title,
             expected_artists=expected_artists,
             strict=False,
+            require_identity=True,
+            relax_duration=True,
         )
         yt = rank_search_candidates(
             [e for s, e in candidates if s == "youtube"],
@@ -1375,6 +1532,8 @@ def download_search_with_quality(
             expected_title=expected_title,
             expected_artists=expected_artists,
             strict=False,
+            require_identity=True,
+            relax_duration=True,
         )
     ordered: list[tuple[str, dict[str, Any]]] = []
     if prefer_soundcloud:
@@ -1396,6 +1555,7 @@ def download_search_with_quality(
 
     best_path: Path | None = None
     best_score = -1.0
+    best_identity = -1.0
     best_kind: ResultKind = "failed"
     best_summary = ""
     tried = 0
@@ -1411,6 +1571,7 @@ def download_search_with_quality(
             if not url:
                 continue
             title = str(entry.get("title") or queries[0])
+            uploader = candidate_uploader(entry)
             cand_dur = entry.get("duration")
             try:
                 cand_dur_f = float(cand_dur) if cand_dur is not None else None
@@ -1423,7 +1584,18 @@ def download_search_with_quality(
                 duration=cand_dur_f,
                 expected_duration=expected_duration,
                 strict=accept_strict,
+                uploader=uploader,
+                require_identity=require_identity,
+                relax_duration=relax_duration,
             ):
+                continue
+            ident = identity_score(
+                title,
+                expected_title=expected_title,
+                expected_artists=expected_artists,
+                uploader=uploader,
+            )
+            if require_identity and ident < MIN_IDENTITY_KEEP:
                 continue
 
             tried += 1
@@ -1464,6 +1636,9 @@ def download_search_with_quality(
                     duration=quality.duration_sec,
                     expected_duration=expected_duration,
                     strict=accept_strict,
+                    uploader=uploader,
+                    require_identity=require_identity,
+                    relax_duration=relax_duration,
                 )
                 if not post_ok:
                     if path != hold_path and path.exists():
@@ -1483,20 +1658,31 @@ def download_search_with_quality(
                 if size_mb < 0.4:
                     score -= 0.2
                 summary = f"fichier {size_mb:.1f} Mo (ffprobe indisponible)"
-            log(f"[{index:02d}/{total}]   ↳ {summary} (score {score:.2f})")
+            log(
+                f"[{index:02d}/{total}]   ↳ {summary} "
+                f"(identité {ident:.2f} · qualité {score:.2f})"
+            )
 
-            if score > best_score:
+            better = ident > best_identity + 0.04 or (
+                ident >= best_identity - 0.02 and score > best_score
+            )
+            if better:
                 saved = _persist_best_copy(path, hold_path)
                 if saved:
                     best_path = saved
                     best_score = score
+                    best_identity = ident
                     best_kind = "soundcloud" if source == "soundcloud" else "youtube"
                     best_summary = summary
             elif path != hold_path and path.exists():
                 path.unlink(missing_ok=True)
 
-            if quality and meets_min_quality(
-                quality, expected_duration=expected_duration, strict=accept_strict
+            if (
+                ident >= 0.75
+                and quality
+                and meets_min_quality(
+                    quality, expected_duration=expected_duration, strict=accept_strict
+                )
             ):
                 break
 
@@ -1506,8 +1692,11 @@ def download_search_with_quality(
 
         # Never discard a downloaded file just because ffprobe could not read it
         # (common on USB sticks). Only reject if we measured quality and it is terrible.
-        if accept_strict and best_score < 0.35:
-            log(f"[{index:02d}/{total}] Aucune version fiable (score {best_score:.2f})")
+        if require_identity and best_identity < MIN_IDENTITY_KEEP:
+            log(
+                f"[{index:02d}/{total}] Aucune version fiable "
+                f"(identité {best_identity:.2f})"
+            )
             return "failed"
 
         try:
@@ -1906,10 +2095,16 @@ def download_playlist(
         spotify_playlist_name = catalog.name
         entries = spotify_tracks_as_entries(catalog)
         log(f"Playlist Spotify « {catalog.name} » — {len(entries)} piste(s).")
-        if len(entries) >= 100:
+        reported = catalog.total_reported
+        if reported and reported > len(entries):
             log(
-                "Note: l’embed Spotify peut tronquer les très longues playlists "
-                "(~100 premiers titres)."
+                f"Attention: Spotify indique {reported} pistes, "
+                f"seulement {len(entries)} ont été lues. Relance ou vérifie le lien."
+            )
+        elif len(entries) == 100:
+            log(
+                "Attention: seulement 100 titres lus (plafond de l’embed Spotify). "
+                "Si la playlist en a plus, relance — la pagination a échoué."
             )
     else:
         extract_opts: dict = {
@@ -2067,6 +2262,7 @@ def download_playlist(
             quality_line = "Qualité: audio YouTube (sans cookies — risque de blocage bot)"
         if quality_max:
             quality_line += " + contrôle qualité"
+    quality_line += " · export RX3 AAC-LC 256 kbps 44,1 kHz"
 
     log(f"Téléchargement ({source_fr} · {kind_fr}) → {output_dir.resolve()}")
     if spotify_playlist_name:
@@ -2074,6 +2270,13 @@ def download_playlist(
     log(quality_line)
     log(f"Téléchargements parallèles: {jobs}")
     log(f"URL: {url}\n")
+
+    recoded = refresh_overspec_exports(output_dir)
+    if recoded:
+        log(
+            f"{recoded} fichier(s) déjà présents recodés pour le RX3 "
+            "(AAC-LC 256 kbps · 44,1 kHz).\n"
+        )
 
     work_items: list[tuple[int, dict[str, Any]]] = []
     skipped = 0
@@ -2172,6 +2375,7 @@ def download_playlist(
         if leftovers:
             log(f"\nConversion des .mp4/.webm restants ({len(leftovers)})…")
             convert_youtube_leftovers(output_dir)
+        refresh_overspec_exports(output_dir)
         if failed_tracks:
             log("\nPistes non téléchargées :")
             for line in failed_tracks:
@@ -2194,6 +2398,8 @@ def download_playlist(
             youtube_ok += conv_ok
             failed = max(0, failed - conv_ok)
         failed += conv_fail
+
+    refresh_overspec_exports(output_dir)
 
     if platform == "spotify":
         keep_stems = {

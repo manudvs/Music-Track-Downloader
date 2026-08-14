@@ -46,16 +46,48 @@ _STOP_WORDS = frozenset(
         "vs",
         "and",
         "de",
-        "original",
-        "mix",
-        "extended",
-        "remix",
-        "radio",
-        "edit",
-        "version",
         "official",
+        "audio",
+        "video",
+        "lyric",
+        "lyrics",
+        "clip",
+        "officiel",
+        "hd",
+        "hq",
+        "4k",
+        "topic",
     }
 )
+
+# Allowed in titles without counting as a "different song"
+_TITLE_FILLER = _STOP_WORDS | frozenset(
+    {
+        "original",
+        "mix",
+        "version",
+        "visualizer",
+        "visual",
+        "hq",
+        "free",
+        "download",
+        "out",
+        "now",
+        "prod",
+        "produced",
+    }
+)
+
+_ALWAYS_BAD_RE = re.compile(
+    r"\b("
+    r"karaoke|slowed|sped\s*up|8d|nightcore|tiktok|"
+    r"reaction|mashup|remix\s*contest|bootleg|"
+    r"weekend\s*mix|dj\s*set|full\s*set|megamix|podcast"
+    r")\b",
+    re.IGNORECASE,
+)
+
+MIN_IDENTITY_KEEP = 0.55
 
 
 @dataclass
@@ -87,7 +119,14 @@ def sanitize_filename_stem(artist: str, title: str) -> str:
 
 
 def significant_words(text: str) -> list[str]:
-    words = re.findall(r"[a-z0-9']+", text.lower())
+    raw = re.findall(r"[a-z0-9']+", text.lower())
+    words: list[str] = []
+    for token in raw:
+        chunks = [part for part in re.split(r"\d+", token) if part]
+        if len(chunks) > 1:
+            words.extend(chunks)
+        else:
+            words.append(token)
     return [w for w in words if len(w) > 2 and w not in _STOP_WORDS]
 
 
@@ -109,6 +148,18 @@ def normalize_title_key(text: str) -> str:
     return t
 
 
+def canonical_expected_title(title: str | None) -> str:
+    """Drop Spotify DJ-playlist ' - Mixed' (not a real mix version)."""
+    if not title:
+        return ""
+    return re.sub(r"\s*-\s*mixed\s*$", "", title.strip(), flags=re.I).strip()
+
+
+def strip_label_brackets(title: str) -> str:
+    """Remove [AZZUR] / [Moan] label tags — not part of the song name."""
+    return re.sub(r"\s*\[[^]]+\]", " ", title).strip()
+
+
 def all_artist_tokens(artists: str) -> list[str]:
     tokens: list[str] = []
     for part in re.split(r"[,&/]| feat\.? | ft\.? | featuring ", artists, flags=re.I):
@@ -123,6 +174,130 @@ def all_artist_tokens(artists: str) -> list[str]:
     return out
 
 
+def candidate_uploader(entry: dict[str, Any] | None) -> str:
+    if not entry:
+        return ""
+    parts: list[str] = []
+    for key in ("channel", "uploader", "artist", "creator"):
+        val = entry.get(key)
+        if val:
+            parts.append(str(val))
+    return " ".join(parts)
+
+
+def compact_alpha(text: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", text.lower())
+
+
+def artist_in_text(artists: str | None, *blobs: str) -> bool:
+    if not artists or not artists.strip():
+        return True
+    hay = normalize_title_key(" ".join(b for b in blobs if b))
+    compact_hay = compact_alpha(hay)
+    tokens = all_artist_tokens(artists)
+    if tokens and any(tok in hay for tok in tokens):
+        return True
+    primary = artists.split(",")[0].strip()
+    compact_artist = compact_alpha(re.sub(r"\([^)]*\)", "", primary))
+    if len(compact_artist) >= 5 and compact_artist in compact_hay:
+        return True
+    return False
+
+
+def version_flags(text: str) -> set[str]:
+    key = normalize_title_key(text)
+    flags: set[str] = set()
+    if re.search(r"\bradio\s*(edit|mix|version)?\b", key):
+        flags.add("radio")
+    if re.search(r"\bextended\b", key):
+        flags.add("extended")
+    if re.search(r"\bremix\b", key):
+        flags.add("remix")
+    if re.search(r"\bmixed\b", key) and "remix" not in flags:
+        flags.add("mixed")
+    return flags
+
+
+def extra_title_tokens(
+    title: str,
+    expected_title: str | None,
+    expected_artists: str | None,
+) -> list[str]:
+    """Content words in the candidate that are not the expected song/artist."""
+    extra: list[str] = []
+    expected = canonical_expected_title(expected_title)
+    title = strip_label_brackets(title)
+    allowed = set(_TITLE_FILLER)
+    allowed.update(significant_words(expected))
+    allowed.update(all_artist_tokens(expected_artists or ""))
+    allowed.update(version_flags(expected))
+    compact_artists = compact_alpha(expected_artists or "")
+    if "radio" in allowed:
+        allowed.update({"radio", "edit"})
+    if "extended" in allowed:
+        allowed.add("extended")
+    allowed.add("mixed")
+    for word in significant_words(title):
+        if word in allowed:
+            continue
+        if word in {"original", "mix", "edit", "radio", "extended", "remix", "mixed"}:
+            continue
+        if compact_artists and word in compact_artists:
+            continue
+        extra.append(word)
+    return extra
+
+
+def title_hit_ratio(title: str, expected_title: str | None) -> float:
+    expected = canonical_expected_title(expected_title)
+    if not expected:
+        return 1.0
+    key_title = normalize_title_key(title)
+    key_expected = normalize_title_key(expected)
+    if key_expected and key_expected in key_title:
+        return 1.0
+    exp_words = significant_words(expected)
+    if not exp_words:
+        return 1.0
+    hits = sum(1 for w in exp_words if w in key_title)
+    return hits / len(exp_words)
+
+
+def identity_score(
+    title: str,
+    *,
+    expected_title: str | None = None,
+    expected_artists: str | None = None,
+    uploader: str | None = None,
+) -> float:
+    """0–1: is this the same recording, ignoring bitrate."""
+    if not title or not title.strip():
+        return 0.0
+    title_hits = title_hit_ratio(title, expected_title)
+    artist_ok = artist_in_text(expected_artists, title, uploader or "")
+    extra = extra_title_tokens(title, expected_title, expected_artists)
+    exp_flags = version_flags(canonical_expected_title(expected_title))
+    got_flags = version_flags(title)
+    score = 0.0
+    score += 0.45 if artist_ok else 0.0
+    score += 0.40 * title_hits
+    if exp_flags:
+        if exp_flags <= got_flags or (exp_flags & got_flags):
+            score += 0.15
+        else:
+            score -= 0.25
+    elif "radio" in got_flags or "extended" in got_flags:
+        score -= 0.08
+    if extra:
+        exp_n = len(significant_words(canonical_expected_title(expected_title)))
+        penalty = 0.18 * len(extra) if exp_n <= 2 else 0.08 * len(extra)
+        score -= min(0.40, penalty)
+    up_key = normalize_title_key(uploader or "")
+    if artist_ok and ("topic" in up_key or "vevo" in up_key):
+        score += 0.05
+    return max(0.0, min(1.0, score))
+
+
 def candidate_acceptable(
     title: str,
     *,
@@ -131,76 +306,95 @@ def candidate_acceptable(
     duration: float | None = None,
     expected_duration: float | None = None,
     strict: bool = False,
+    uploader: str | None = None,
+    require_identity: bool | None = None,
+    relax_duration: bool = False,
 ) -> bool:
     """Reject obvious wrong matches before downloading."""
     if not title or not title.strip():
         return False
     lower = title.lower()
-    norm_expected = (expected_title or "").lower().strip()
+    expected = canonical_expected_title(expected_title)
     key_title = normalize_title_key(title)
-    key_expected = normalize_title_key(expected_title or "")
+    key_expected = normalize_title_key(expected)
+    identity = strict if require_identity is None else require_identity
+    artist_ok = artist_in_text(expected_artists, title, uploader or "")
+    title_hits = title_hit_ratio(title, expected_title)
+    exp_words = significant_words(expected) if expected else []
+    extra = extra_title_tokens(title, expected_title, expected_artists)
+    identity_strong = bool(
+        artist_ok and title_hits >= 0.8 and (len(exp_words) > 2 or not extra)
+    )
 
-    if strict:
-        if _BAD_TITLE_RE.search(title) or _REJECT_EXTRA_RE.search(title):
+    if _ALWAYS_BAD_RE.search(title):
+        return False
+    if identity:
+        if _BAD_TITLE_RE.search(title) and not identity_strong:
             return False
         if "#" in title:
             return False
-        # Reject radio edit/mix only when Spotify title is NOT a radio version
-        wants_radio = "radio" in key_expected
-        if ("radio edit" in lower or "radio mix" in lower) and not wants_radio:
-            dur_ok = (
-                expected_duration
-                and duration
-                and abs(duration - expected_duration) / expected_duration
-                <= DURATION_TOLERANCE
-            )
-            if not dur_ok:
-                return False
         if " x " in lower and " x " not in (expected_title or "").lower():
             return False
 
-    # Title match strength (hyphen / parentheses / punctuation tolerant)
-    title_hits = 0.0
-    exp_words = significant_words(expected_title or "") if expected_title else []
-    if key_expected and key_expected in key_title:
-        title_hits = 1.0
-    elif exp_words:
-        hits = sum(1 for w in exp_words if w in key_title)
-        title_hits = hits / len(exp_words)
+    if identity and expected_artists and not artist_ok:
+        return False
 
-    if strict and expected_artists:
-        tokens = all_artist_tokens(expected_artists)
-        artist_ok = bool(tokens and any(tok in key_title for tok in tokens))
-        # Strong title match can stand alone (uploads often omit artist)
-        if tokens and not artist_ok and title_hits < 0.7:
-            return False
-
-    if strict and expected_title:
-        if title_hits >= 0.55:
-            pass
-        elif "extended" in key_expected and "original mix" in key_title:
-            pass
-        elif "radio" in key_expected and "radio" in key_title:
-            # core song name without "radio mix/edit"
-            core = significant_words(
-                re.sub(r"\bradio\s*(mix|edit)\b", "", expected_title or "", flags=re.I)
-            )
-            if core and all(w in key_title for w in core):
+    if identity and expected_title:
+        if title_hits < 0.55:
+            if "extended" in key_expected and "original mix" in key_title:
                 pass
+            elif "radio" in key_expected and "radio" in key_title:
+                core = significant_words(
+                    re.sub(r"\bradio\s*(mix|edit)\b", "", expected_title or "", flags=re.I)
+                )
+                if not (core and all(w in key_title for w in core)):
+                    return False
             else:
                 return False
-        else:
+        # Short titles: extra words = different song ("Welcome to the Good Hood")
+        if len(exp_words) <= 2 and extra:
+            return False
+        if len(extra) >= 3:
+            return False
+        exp_flags = version_flags(expected)
+        got_flags = version_flags(title)
+        if "radio" in exp_flags and "radio" not in got_flags and not relax_duration:
+            return False
+        if "extended" in exp_flags and "extended" not in got_flags and "original" not in key_title:
+            if not relax_duration:
+                return False
+        if "radio" not in exp_flags and "radio" in got_flags and not identity_strong:
+            return False
+        if "extended" not in exp_flags and "extended" in got_flags and not identity_strong:
+            return False
+        if "remix" in got_flags and "remix" not in exp_flags and not identity_strong:
             return False
 
     if expected_duration and duration and duration > 0:
         diff = abs(duration - expected_duration) / expected_duration
-        limit = DURATION_TOLERANCE if strict else 0.15
-        if diff > limit:
-            return False
-        if duration > expected_duration * 1.15 and duration > 480:
-            return False
-        if duration > expected_duration + 90 and duration > 360:
-            return False
+        abs_diff = abs(duration - expected_duration)
+        shorter, longer = min(duration, expected_duration), max(duration, expected_duration)
+        if identity_strong:
+            # Same artist+title: radio vs extended of the same track
+            if 90 <= shorter and longer <= 720 and shorter / longer >= 0.38:
+                pass
+            elif diff > 0.35 and abs_diff > 45:
+                return False
+            elif longer > 720 and abs_diff > 90:
+                return False
+        elif relax_duration:
+            if diff > 0.35 and abs_diff > 45:
+                return False
+            if duration > expected_duration + 90 and duration > 360:
+                return False
+        else:
+            limit = DURATION_TOLERANCE if strict else 0.15
+            if diff > limit:
+                return False
+            if duration > expected_duration * 1.15 and duration > 480:
+                return False
+            if duration > expected_duration + 90 and duration > 360:
+                return False
 
     return True
 
@@ -304,8 +498,9 @@ def analyze_audio(path: Path, *, ffprobe: str | None = None) -> AudioQuality | N
 def duration_match_score(actual: float | None, expected: float | None) -> float:
     if not expected or expected <= 0 or not actual or actual <= 0:
         return 0.55
-    diff = abs(actual - expected) / expected
-    if diff <= 0.05:
+    abs_diff = abs(actual - expected)
+    diff = abs_diff / expected
+    if abs_diff <= 5 or diff <= 0.03:
         return 1.0
     if diff <= DURATION_TOLERANCE:
         return 0.85
@@ -376,14 +571,17 @@ def rank_search_candidates(
     expected_title: str | None = None,
     expected_artists: str | None = None,
     strict: bool = False,
+    require_identity: bool | None = None,
+    relax_duration: bool = False,
 ) -> list[dict[str, Any]]:
-    """Sort flat search results: filter bad matches, then score."""
-    scored: list[tuple[float, dict[str, Any]]] = []
-    q_lower = query.lower()
+    """Sort flat search results: identity first, then duration."""
+    scored: list[tuple[float, float, dict[str, Any]]] = []
+    identity = strict if require_identity is None else require_identity
     for cand in candidates:
         if not cand:
             continue
         title = str(cand.get("title") or cand.get("fulltitle") or "")
+        uploader = candidate_uploader(cand)
         dur = cand.get("duration")
         try:
             dur_f = float(dur) if dur is not None else None
@@ -396,24 +594,23 @@ def rank_search_candidates(
             duration=dur_f,
             expected_duration=expected_duration,
             strict=strict,
+            uploader=uploader,
+            require_identity=identity,
+            relax_duration=relax_duration,
         ):
             continue
-        score = duration_match_score(dur_f, expected_duration)
-        score += title_penalty(title)
-        tokens = [t for t in re.split(r"\s+", q_lower) if len(t) > 2]
-        if tokens:
-            hits = sum(1 for t in tokens if t in title.lower())
-            score += 0.15 * (hits / len(tokens))
-        if expected_title and expected_title.lower() in title.lower():
-            score += 0.25
-        if expected_artists:
-            for tok in primary_artist_tokens(expected_artists):
-                if tok in title.lower():
-                    score += 0.1
-                    break
-        scored.append((score, cand))
-    scored.sort(key=lambda pair: pair[0], reverse=True)
-    return [c for _, c in scored]
+        ident = identity_score(
+            title,
+            expected_title=expected_title,
+            expected_artists=expected_artists,
+            uploader=uploader,
+        )
+        if identity and ident < MIN_IDENTITY_KEEP:
+            continue
+        dur_s = duration_match_score(dur_f, expected_duration)
+        scored.append((ident, dur_s + title_penalty(title), cand))
+    scored.sort(key=lambda pair: (pair[0], pair[1]), reverse=True)
+    return [c for _, _, c in scored]
 
 
 def newest_audio_file(output_dir: Path, before: set[str]) -> Path | None:
