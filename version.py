@@ -4,7 +4,7 @@ from __future__ import annotations
 
 APP_NAME = "Music Track Downloader"
 APP_NAME_SHORT = "MusicTrackDownloader"
-APP_VERSION = "1.1.9"
+APP_VERSION = "1.1.10"
 
 GITHUB_OWNER = "emmanueldevins"
 GITHUB_REPO = "Music-Track-Downloader"
