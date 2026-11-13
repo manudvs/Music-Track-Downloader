@@ -354,6 +354,59 @@ def apply_js_runtime(ydl_opts: dict) -> None:
     ydl_opts["js_runtimes"] = {"deno": {}}
 
 
+def read_cover_art(source: Path) -> bytes | None:
+    """Cover image embedded in an audio file, else a sidecar image next to it."""
+    try:
+        import base64
+
+        import mutagen
+        from mutagen.flac import Picture
+
+        audio = mutagen.File(str(source))
+        tags = getattr(audio, "tags", None) if audio is not None else None
+        if tags is not None:
+            covers = tags.get("covr") if hasattr(tags, "get") else None
+            if covers:
+                return bytes(covers[0])
+            if hasattr(tags, "getall"):
+                apic = tags.getall("APIC")
+                if apic:
+                    return bytes(apic[0].data)
+            blocks = tags.get("metadata_block_picture") if hasattr(tags, "get") else None
+            if blocks:
+                return bytes(Picture(base64.b64decode(blocks[0])).data)
+        pictures = getattr(audio, "pictures", None)
+        if pictures:
+            return bytes(pictures[0].data)
+    except Exception:
+        pass
+    for ext in (".jpg", ".jpeg", ".png"):
+        side = source.with_suffix(ext)
+        try:
+            if side.is_file() and side.stat().st_size > 0:
+                return side.read_bytes()
+        except OSError:
+            continue
+    return None
+
+
+def copy_cover_art(source: Path, dest: Path) -> bool:
+    """Carry the cover over to a re-encoded .m4a (ffmpeg -vn drops it)."""
+    data = read_cover_art(source)
+    if not data:
+        return False
+    try:
+        from mutagen.mp4 import MP4, MP4Cover
+
+        fmt = MP4Cover.FORMAT_PNG if data.startswith(b"\x89PNG") else MP4Cover.FORMAT_JPEG
+        audio = MP4(str(dest))
+        audio["covr"] = [MP4Cover(data, imageformat=fmt)]
+        audio.save()
+        return True
+    except Exception:
+        return False
+
+
 def encode_dj_safe_m4a(source: Path, dest: Path) -> Path | None:
     """Pioneer XDJ-RX3: AAC-LC CBR 256 kbps, 44.1 kHz stereo, faststart.
 
@@ -422,6 +475,7 @@ def encode_dj_safe_m4a(source: Path, dest: Path) -> Path | None:
             except (OSError, subprocess.TimeoutExpired):
                 continue
             if result.returncode == 0 and scratch.is_file() and scratch.stat().st_size > 1024:
+                copy_cover_art(source, scratch)
                 if dest.exists():
                     dest.unlink(missing_ok=True)
                 shutil.copy2(scratch, dest)
@@ -531,6 +585,7 @@ def convert_file_to_m4a(source: Path, dest: Path | None = None) -> Path | None:
     except (OSError, subprocess.TimeoutExpired):
         return None
     if result.returncode == 0 and dest.is_file() and dest.stat().st_size > 1024:
+        copy_cover_art(source, dest)
         if dest != source:
             source.unlink(missing_ok=True)
         return dest
